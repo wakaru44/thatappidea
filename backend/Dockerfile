@@ -6,11 +6,7 @@ WORKDIR /opt/thisapp
 
 ADD . .
 
-RUN virtualenv env && \
-    source env/bin/activate && \
-    pip install -r requirements.txt
-
 EXPOSE 5000
 
-
-CMD ["/usr/bin/python","app.py"]
+#CMD ["/usr/bin/python","app.py"]
+CMD ["/usr/bin/bash"]

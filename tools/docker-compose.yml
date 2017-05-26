@@ -1,0 +1,26 @@
+version: '3'
+services:
+    thisapi:
+        build:
+            context: ../backend
+            dockerfile: Dockerfile
+        networks:
+            - internal
+        ports:
+            - 5000:5000
+
+    thisapp:
+        build:
+            context: ../frontend
+            dockerfile: Dockerfile
+        networks:
+            - internal
+            - external
+        ports:
+            - 80:8080
+            - 443:8443
+networks:
+    internal:
+    external:
+        # Probably some stuff to give it external access.
+

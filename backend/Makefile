@@ -18,3 +18,9 @@ dev:
 
 setup:
 	virtualenv env; source env/bin/activate && pip install -r requirements.txt
+
+docker-build: Dockerfile
+	@docker build . -t thisapi
+
+docker-run: docker-build
+	@docker run -ti thisapi:latest /bin/sh
