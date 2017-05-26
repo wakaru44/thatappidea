@@ -1,6 +1,8 @@
-# Backend
 
-Built in Python using flask.
+# This App™ - This API
 
-Persistance is trivial, with sqlite (or maybe just json files, not sure yet)
+The backend for This App™.
 
+A very simple backend that returns a simple playlist
+
+TODO: Update this shit once we have a nice data store
