@@ -95,6 +95,8 @@ function setOpenSSL() {
 	else
 		OPENSSL=/usr/bin/openssl
 	fi
+	OPENSSL=/usr/bin/openssl
+    echo "WTF Bro, openssl can be installed in other places in different OSX"
 	[ ! -x "$OPENSSL" ] && echo "ERROR: $OPENSSL not installed." >&2 && exit 1
 }
 

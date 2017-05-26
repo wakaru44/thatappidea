@@ -1,11 +1,12 @@
 # A simple makefile to make things simpler
 
 help:
-	@echo "This App™. This API
+	@echo "This App™. This API";
 	@echo "";
 	@echo "help           - This text";
 	@echo "todo           - Will print all the TODO's in the code";
 	@echo "dev            - Run the dev server";
+	@echo "setup          - Setup the virtualenv";
 	@echo "";
 
 
@@ -14,3 +15,6 @@ todo:
 
 dev:
 	python app.py
+
+setup:
+	virtualenv env; source env/bin/activate && pip install -r requirements.txt
