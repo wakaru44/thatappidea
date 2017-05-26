@@ -1,0 +1,12 @@
+
+
+# Vim stuff
+*swp
+
+# Python things
+env/
+*pyc
+
+# Crap
+archive
+*log
