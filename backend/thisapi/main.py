@@ -16,7 +16,44 @@ def event_listener(whatever):
 
 @app.route('/')
 def index():
-    return "You are at the homepage!"
+    return "You are at the homepage of this API™!"
+
+def retrieve_party(party_id= None):
+    """
+    Retrieve the party from whatever datastore
+    """
+    assert party_id is not  None
+    party_data = {
+            "partyid":"XXXX",
+            "videos":[
+                {"v":"ZZZZ","title":"papayas"},
+                {"v":"AAAA","title":"bananas"},
+            ]
+    }
+    return party_data
+
+
+@app.route('/v1/get_party')
+def get_party():
+    """
+    Retrieve the party for the given id.
+    """
+    #TODO: This get_party method is just a fake stub
+    party_data = retrieve_party("XXXX") #TODO: remove XXXX and pass the requested id
+    party_content = json.dumps(party_data)
+    return render_template('json.html', data=party_content)
+
+
+@app.route('/v1/add_vid')
+def add_vid():
+    """
+    Add a video to the end of the playlist
+    """
+    party_data = retrieve_party("XXXX")
+    video = {"v":request.params["v"], "title":"FOOBAR"}
+    party_data["videos"].append(video) #TODO: check if this is in fact mutable.
+    party_content = json.dumps(party_data)
+    return render_template('json.html', data=party_content)
 
 
 @app.route('/redirect-to-<function>')
