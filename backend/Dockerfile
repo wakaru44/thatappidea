@@ -18,5 +18,6 @@ EXPOSE 5000
 
 # To activate teh debugger.
 ENV FLASK_DEBUG=1
+ENV DATABASE_URL=redis
 
 CMD ["dev/bin/python","app.py", "--host=0.0.0.0"]

@@ -13,5 +13,6 @@ if __name__ == '__main__':
         file_handler.setLevel(logging.WARNING)
         app.logger.addHandler(file_handler)
 
+    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False # Is it here?
     app.debug = app.config['DEBUG']
     app.run(host="0.0.0.0")
