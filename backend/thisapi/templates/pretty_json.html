@@ -1,0 +1,19 @@
+<head>
+	<link rel="stylesheet" href="../static/css/json-viewer.css">
+	<script src="../static/js/jquery-3.2.1.min.js"></script>
+	<script src="../static/js/json-viewer.js"></script>
+
+</head>
+<body>
+	<div id="json-container"></div>
+
+	<script>
+        {% if data %}
+		var json = '{{ data | tojson }}';
+        {% else %}
+        var json = '{"Error":" No data received"}';
+        {% endif %}
+
+		$('#json-container').jsonview(json); // Support json string/object
+	</script>
+</body>

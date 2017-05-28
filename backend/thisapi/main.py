@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 from flask import Flask, url_for, render_template, request, \
-    redirect, abort, session, g, flash, Markup, json
+    redirect, abort, session, g, flash, Markup, jsonify
 from thisapi import app
 
 
@@ -26,7 +26,7 @@ def retrieve_party(party_id= None):
     """
     assert party_id is not  None
     party_data = {
-            "partyid":party_id,
+            'partyid':party_id,
             "videos":[
                 {"v":"ZZZZ","title":"papayas"},
                 {"v":"AAAA","title":"bananas"},
@@ -35,7 +35,7 @@ def retrieve_party(party_id= None):
     return party_data
 
 
-@app.route('/v1/get_party', defaults={"path": ""})
+@app.route('/v1/get_party', defaults={"requestpath": ""})
 @app.route('/v1/get_party.<path:requestpath>')
 def get_party(requestpath= None):
     """
@@ -43,9 +43,16 @@ def get_party(requestpath= None):
     """
     #TODO: This get_party method is just a fake stub
     requested_id = request.args['pid']
-    party_data = retrieve_party(requested_id)
-    party_content = json.dumps(party_data)
-    return render_template('json.html', data=party_content)
+    party_content = retrieve_party(requested_id)
+    # give at least some default data
+    if party_content is  None:
+        party_content = {"Error": "No party found"}
+
+    # Choose the output format
+    if requestpath == "json":
+        return jsonify(party_content)
+    # If nothing else, just output a pretty something
+    return render_template('pretty_json.html', data=party_content)
 
 
 @app.route('/v1/add_vid')
