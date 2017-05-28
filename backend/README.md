@@ -6,6 +6,7 @@ The backend for This App™.
 A very simple backend that returns a simple playlist
 
 TODO: Update this shit once we have a nice data store
+Currently working on a redis backend, based on [this link](https://realpython.com/blog/python/flask-by-example-implementing-a-redis-task-queue/)
 
 # Endpoints
 
