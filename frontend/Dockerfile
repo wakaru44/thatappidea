@@ -1,13 +1,10 @@
-FROM nginx:latest
+FROM nginx:alpine
+# see https://hub.docker.com/_/nginx/
 
-# TODO: The official nginx dockerfile probably has some specifiq env vars
+ENV nginx_home=/usr/share/nginx/html
 
-ENV nginx_home=/var/www
+COPY .  /usr/share/nginx/html
 
-RUN mkdir -p /var/www/thisapp
-
-WORKDIR /var/www/thisapp
-
-ADD . .
+WORKDIR /usr/share/nginx/html
 
 # And now some sort of supervisord or nginx service must go up
