@@ -19,6 +19,14 @@ services:
         ports:
             - 8080:80
             - 8443:443
+    redis:
+        image: redis:alpine
+        networks:
+            - internal
+            - external
+        ports:
+            - 6379:6379
+
 networks:
     internal:
     external:
