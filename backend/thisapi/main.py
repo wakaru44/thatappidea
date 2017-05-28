@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 from flask import Flask, url_for, render_template, request, \
-    redirect, abort, session, g, flash, Markup
+    redirect, abort, session, g, flash, Markup, json
 from thisapi import app
 
 
@@ -26,7 +26,7 @@ def retrieve_party(party_id= None):
     """
     assert party_id is not  None
     party_data = {
-            "partyid":"XXXX",
+            "partyid":party_id,
             "videos":[
                 {"v":"ZZZZ","title":"papayas"},
                 {"v":"AAAA","title":"bananas"},
@@ -35,13 +35,15 @@ def retrieve_party(party_id= None):
     return party_data
 
 
-@app.route('/v1/get_party')
-def get_party():
+@app.route('/v1/get_party', defaults={"path": ""})
+@app.route('/v1/get_party.<path:requestpath>')
+def get_party(requestpath= None):
     """
     Retrieve the party for the given id.
     """
     #TODO: This get_party method is just a fake stub
-    party_data = retrieve_party("XXXX") #TODO: remove XXXX and pass the requested id
+    requested_id = request.args['pid']
+    party_data = retrieve_party(requested_id)
     party_content = json.dumps(party_data)
     return render_template('json.html', data=party_content)
 
