@@ -17,7 +17,7 @@ build: tools/docker-compose.yml backend/Dockerfile frontend/Dockerfile
 run-dev: build
 	@docker-compose -f tools/docker-compose.yml up -d
 
-deploy:
+deploy: 
 	@echo"TODO: Some instructions to run the ansible that deploys this shit";
 frontend:
 	@echo "TODO: add makefile command to run the frontend container";

@@ -1,4 +1,6 @@
 
+# -*- coding: utf-8 -*-
+
 from flask import Flask, url_for, render_template, request, \
     redirect, abort, session, g, flash, Markup
 from thisapi import app

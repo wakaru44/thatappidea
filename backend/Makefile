@@ -22,5 +22,5 @@ setup:
 docker-build: Dockerfile
 	@docker build . -t thisapi
 
-docker-run: docker-build
-	@docker run -ti thisapi:latest /bin/sh
+docker-run: 
+	@docker run -ti thisapi:latest 
