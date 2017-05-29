@@ -10,3 +10,9 @@ env/
 # Crap
 archive
 *log
+
+# Secrets
+*pem
+*pem.pub # no secrets at all
+stack-parameters
+tools/cloudformation/stacks/ # All the stacks files altogether

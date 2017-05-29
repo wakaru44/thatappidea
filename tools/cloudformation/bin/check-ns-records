@@ -1,0 +1,93 @@
+#!/bin/bash
+
+USAGE="Usage: $(basename $0) --domain-name/-d domain-name"
+EXTERNAL_DOMAIN_NAME=
+DOMAIN_NAME=
+STACK_NAME=
+STACK_DIR=
+PROFILE=
+REGION=
+
+function parseCommandLine() {
+	while [ $# -ge 2 ] ; do
+		OPT=$1
+		OPTARG=$2
+		shift 2
+		case $OPT in
+			--domain-name|-d)
+				DOMAIN_NAME=$OPTARG
+				STACK_NAME=$(echo $DOMAIN_NAME | sed -e 's/[^a-zA-Z0-9]//g')
+				STACK_DIR=stacks/$STACK_NAME
+				;;
+			*)
+				echo $USAGE >&2
+				exit 1
+				;;
+		esac
+	done
+
+	if [ $# -ne 0 ] ;then
+		echo "$USAGE" >&2 
+		exit 1
+	fi
+
+	[ -z "$DOMAIN_NAME" ] && echo "$USAGE, -d is missing" >&2 && exit 1
+	[ ! -f "$STACK_DIR/stack-parameters" ] && echo "$USAGE, the file stack-parameters is missing from $STACK_DIR" >&2 && exit 1
+
+	PROFILE=$(awk -F= '/AWSProfile/ { print $2;}' $STACK_DIR/stack-parameters)
+	[ -z "$PROFILE" ] && echo "ERROR: AWSProfile is missing from stack parameters" >&2 && exit 1
+
+	REGION=$(awk -F= '/AWSRegion/ { print $2;}' $STACK_DIR/stack-parameters)
+	[ -z "$REGION" ] && echo "ERROR: AWSRegion is missing from stack parameters" >&2 && exit 1
+
+	EXTERNAL_DOMAIN_NAME=$(awk -F= '/ExternalDomainName/ { print $2;}' $STACK_DIR/stack-parameters)
+	[ -z "$EXTERNAL_DOMAIN_NAME" ] && echo "ERROR: ExternalDomainName is missing from stack parameters" >&2 && exit 1
+
+	EXTERNAL_HOSTED_ZONE_ID=$(awk -F= '/ExternalHostedZoneId/ { print $2;}' $STACK_DIR/stack-parameters)
+	[ -z "$EXTERNAL_HOSTED_ZONE_ID" ] && echo "ERROR: HostedZoneId is missing from stack parameters" >&2 && exit 1
+}
+
+
+function _getResourceRecordSet() {
+        local HOSTED_ZONE_ID; local NAME; local TYPE;
+	HOSTED_ZONE_ID=$1
+	NAME=$(echo $2 | sed -e 's/\.$//' -e 's/$/./')
+	TYPE=$3
+	aws --profile $PROFILE --region $REGION route53 list-resource-record-sets --hosted-zone-id $HOSTED_ZONE_ID \
+		| jq -r --arg name $NAME --arg type $TYPE \
+			'.ResourceRecordSets | map(select(.Name==$name and .Type == $type) | .ResourceRecords[] | .Value ) | .[] ' \
+		| sort
+}
+
+function _getExternalNameservers() {
+	dig +short NS $1 | sort
+}
+
+function checkNameserverRecordsExternalHostedZone() {
+        local NAME; local PARENT_NAME; local NAMESERVERS; local PARENT_HOSTED_ZONE_ID; local ACTION; 
+
+	NAME=$(echo $EXTERNAL_DOMAIN_NAME | sed -e 's/\.$//' -e 's/$/./')
+	PARENT_NAME="$(echo $NAME | cut -d. -f2-)"
+
+
+        NAMESERVERS=$(_getResourceRecordSet $EXTERNAL_HOSTED_ZONE_ID $NAME NS)
+        if [ -z "$NAMESERVERS" ] ; then
+                echo "ERROR: failed to obtain NS record for $NAME." >&2
+                exit 1
+        fi
+
+	EXISTING_NAMESERVERS="$(_getExternalNameservers $NAME)"
+	if [ "$NAMESERVERS" == "$EXISTING_NAMESERVERS" ] ; then
+		echo "INFO: $PARENT_NAME is pointing to hosted zone of $NAME"  >&2
+	else
+		echo "NOTICE: toplevel domain $PARENT_NAME is NOT pointing to the hosted zone of $NAME. Add a NS record manually. "  >&2
+		for ns in $NAMESERVERS ; do
+			echo "	$(echo $NAME | cut -d. -f1) NS 300 $ns" >&2
+		done
+	fi
+
+	test  "$NAMESERVERS" == "$EXISTING_NAMESERVERS"
+}
+
+parseCommandLine "$@"
+checkNameserverRecordsExternalHostedZone 
