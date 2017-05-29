@@ -1,0 +1,22 @@
+{
+    "TemplateBody": "personal_stack.json", 
+    "Parameters": [
+        {
+            "ParameterKey": "KeyPair", 
+            "ParameterValue": "jenkinsWakaru", 
+            "UsePreviousValue": true
+        }
+    ], 
+    "TimeoutInMinutes": 10, 
+    "OnFailure": "DO_NOTHING", 
+    "Tags": [
+        {
+            "Key": "Environment", 
+            "Value": "dev"
+        },
+        {
+          "Key":"Name",
+          "Value":"PersonalStack"
+        }
+    ]
+}

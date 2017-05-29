@@ -1,0 +1,1169 @@
+#!/usr/bin/env python
+import boto3
+import argparse
+import os.path
+import re
+import sys
+import io
+import json
+import time
+import StringIO
+from datetime import datetime
+from botocore.exceptions import ClientError
+import subprocess
+from git_release_tag import GitReleaseTagger
+
+
+def aws_name(name):
+    return re.sub('[^a-zA-Z0-9]', '', name)
+
+
+class StackUpdate:
+
+    def __init__(self):
+        self.verbose = False
+        self.domain_name = None
+        self.stackname = None
+        self.aws_profile = None
+        self.aws_region = None
+        self.parameter_keys = []
+        self.parameters = None
+        self.parameters_filename = None
+        self.template_filename = None
+        self.template_basename = None
+        self.changeset_filename = None
+        self.stack = None
+        self.current_template = None
+        self.current_parameters = None
+        self.capabilities = ['CAPABILITY_IAM']
+        self.deployed_templates = []
+        self.operation = None
+        self.changeset_directory = None
+        self.force = False
+
+    def set_template_filename(self, name):
+        shortcut_path = os.path.join('config', name, '%s.json' % name)
+        if os.path.isfile(name):
+            self.template_filename = name
+            self.template_basename = os.path.splitext(
+                os.path.basename(name))[0]
+        elif os.path.isfile(shortcut_path):
+            self.template_filename = shortcut_path
+            self.template_basename = os.path.splitext(
+                os.path.basename(name))[0]
+        else:
+            raise ValueError("%s is not a file." % name)
+
+    def load_template(self):
+        loader = TemplateLoader(self.template_filename, verbose=self.verbose)
+        self.template = loader.load()
+        self.git_release = loader.get_git_release()
+        self.parameters['GitRelease'] = self.git_release
+	if '-dirty' in self.git_release:
+		sys.stderr.write('ERROR: refusing to load dirty release %s. Please commit your changes first.\n' % self.git_release)
+		sys.exit(1)
+
+    def create_cfn_parameters(self, for_create=False):
+
+        if not for_create:
+            self.get_current_template()
+
+        result = []
+        for key in self.template['Parameters']:
+            if key in self.parameters:
+                parameter_definition = self.template['Parameters'][key]
+                allow_echo = (parameter_definition[
+                              'NoEcho'] != 'true') if 'NoEcho' in parameter_definition else True
+                if self.current_template and key in self.current_parameters and self.parameters[
+                        key] == self.current_parameters[key]:
+                    result.append(
+                        {'ParameterKey': key, 'UsePreviousValue': True})
+                else:
+                    if allow_echo:
+                        if not for_create:
+                            if key in self.current_parameters:
+                                print "INFO: changing parameter %s from '%s' to '%s'" % (key, self.current_parameters[key], self.parameters[key])
+                            else:
+                                print "INFO: setting new parameter %s to '%s'" % (key, self.parameters[key])
+                    else:
+                        if self.verbose:
+                            print 'INFO: setting secret parameter %s' % key
+                    result.append({'ParameterKey': key, 'ParameterValue': self.parameters[
+                                  key], 'UsePreviousValue': False})
+            else:
+                if not for_create:
+                    # When the key is not in the parameter file and it is an  update, but the existing template does
+                    # not have a value for the parameter, use the default value.abs
+                    parameter_definition = self.template['Parameters'][key]
+                    if key not in self.current_parameters and 'Default' in parameter_definition:
+                        print "INFO: applying default value '%s' for parameter %s " % (parameter_definition['Default'], key)
+                        result.append({'ParameterKey': key, 'ParameterValue': parameter_definition['Default'], 'UsePreviousValue': False})
+                    else:
+                        if self.verbose:
+                            print "INFO: keep current value for parameter %s " % (key)
+                        result.append(
+                            {'ParameterKey': key, 'UsePreviousValue': True})
+        return result
+
+    def create_cfn_tags(self):
+        result = [{'Key': 'GitRelease', 'Value': self.git_release}]
+        for key in ['Tenant', 'Environment', 'DomainName', 'ExternalDomainName']:
+            if key in self.parameters:
+                result.append({'Key': key, 'Value': self.parameters[key]})
+            else:
+                raise ValueError(
+                    'ERROR: parameter "%s" is required, but is not specified.' % key)
+        return result
+
+    def load_parameters(self):
+        if not self.parameters_filename:
+            self.set_parameters_filename(
+                './stacks/%s/stack-parameters' % aws_name(self.domain_name))
+
+        self.parameters = {}
+        with open(self.parameters_filename, "r") as file:
+            for line in file:
+                line = line.rstrip()
+                parts = line.split("=", 2)
+                if len(parts) == 2:
+                    self.parameter_keys.append(parts[0])
+                    if parts[0] not in self.parameters:
+                        self.parameters[parts[0]] = parts[1]
+                    else:
+                        raise ValueError("Parameter %s defined more than once" % parts[0])
+                else:
+                    raise ValueError("incorrect syntax: %s" % line)
+        if 'DomainName' in self.parameters and self.parameters['DomainName'].rstrip('. \t') != self.domain_name:
+            raise ValueError('ERROR: incorrect domain name specified on command line: %s instead of %s' % (self.domain_name, self.parameters['DomainName']))
+
+        self.add_default_parameters()
+
+    def set_aws_profile(self):
+        if self.aws_profile is None:
+            if 'AWSProfile' in self.parameters:
+                self.aws_profile = self.parameters['AWSProfile']
+            else:
+                self.aws_profile = os.getenv(
+                    'AWS_PROFILE', os.getenv('AWS_DEFAULT_PROFILE', 'default'))
+        else:
+            if 'AWSProfile' in self.parameters:
+                if self.parameters['AWSProfile'] == self.aws_profile:
+                    sys.stderr.write('WARN: ignoring --profile %s, it is already specified in stack-parameters\n' %
+                                     (self.aws_profile))
+                else:
+                    sys.stderr.write('ERROR: --profile %s cannot override %s defined in stack-parameters\n' %
+                                     (self.aws_profile, self.parameters['AWSProfile']))
+
+    def set_aws_region(self):
+        if self.aws_region is None:
+            if 'AWSRegion' in self.parameters:
+                self.aws_region = self.parameters['AWSRegion']
+            else:
+                self.aws_region = os.getenv('AWS_DEFAULT_REGION', None)
+        else:
+            if 'AWSRegion' in self.parameters:
+                if self.parameters['AWSRegion'] == self.aws_region:
+                    sys.stderr.write('WARN: ignoring --region %s, it is already specified in stack-parameters\n' %
+                                     (self.aws_region))
+                else:
+                    sys.stderr.write('ERROR: --region %s cannot override %s defined in stack-parameters\n' %
+                                     (self.aws_region, self.parameters['AWSRegion']))
+                    sys.exit(1)
+
+    def load_deployed_templates(self):
+        if 'DeployedTemplates' in self.parameters:
+            self.deployed_templates = json.loads(
+                self.parameters['DeployedTemplates'])
+            if not isinstance(self.deployed_templates, list):
+                sys.stderr.write(
+                    'ERROR: the DeployedTemplates parameters is not a JSON array.')
+                sys.exit(1)
+        else:
+            self.parameters['DeployedTemplates'] = '[]'
+            self.parameter_keys.append('DeployedTemplates')
+            self.deployed_templates = []
+
+    def register_template(self):
+        if self.template_filename not in self.deployed_templates:
+            self.deployed_templates.append(self.template_filename)
+            self.parameters['DeployedTemplates'] = json.dumps(
+                self.deployed_templates)
+
+    def unregister_template(self):
+        if self.template_filename in self.deployed_templates:
+            del self.deployed_templates[self.deployed_templates.index(self.template_filename)]
+            self.parameters['DeployedTemplates'] = json.dumps(self.deployed_templates)
+
+    def add_default_parameters(self):
+        if 'DomainName' not in self.parameters:
+            self.parameters[
+                'DomainName'] = '%s.' % self.domain_name.rstrip('. \t')
+
+        self.set_aws_profile()
+        self.set_aws_region()
+        self.load_deployed_templates()
+
+    def describe_stack(self):
+        name = self.stack['StackId'] if self.stack else self.stackname
+        response = self.cfn.describe_stacks(StackName=name)
+        self.stack = response['Stacks'][0] if response and 'Stacks' in response and len(
+            response['Stacks']) > 0 else None
+
+    def get_stack_tags(self):
+        self.describe_stack()
+        if self.stack is None:
+            raise ValueError('Stack %s does not exist.' % self.stackname)
+        return self.stack['Tags']
+
+    def get_stack_status(self):
+        self.describe_stack()
+        if self.stack is None:
+            raise ValueError('Stack %s does not exist.' % self.stackname)
+        return self.stack['StackStatus']
+
+    def connect_aws(self):
+        kwargs = {'profile_name': self.aws_profile}
+        if self.aws_region:
+            kwargs['region_name'] = self.aws_region
+        self.session = boto3.Session(**kwargs)
+
+        self.cfn = self.session.client('cloudformation')
+        self.ec2 = self.session.client('ec2')
+        self.s3 = self.session.client('s3')
+        self.sts = self.session.client('sts')
+        self.account_id = self.sts.get_caller_identity()['Account']
+
+    def initialize(self):
+        self.load_parameters()
+        self.connect_aws()
+
+    def set_stack_name(self, verbose=True):
+        if not self.stackname:
+            self.stackname = '%s-%s' % (aws_name(self.domain_name),
+                                        aws_name(self.template_basename))
+            response = self.cfn.describe_stacks()
+            names = filter(lambda n: n == self.stackname or n.startswith('%s-' % self.stackname),
+                           map(lambda s: s['StackName'], response['Stacks']))
+            if len(names) == 0:
+                if verbose:
+                    sys.stderr.write(
+                        'INFO: stackname set to %s\n' % self.stackname)
+            elif len(names) == 1:
+                if verbose:
+                    sys.stderr.write(
+                        'INFO: stackname found was %s\n' % names[0])
+                self.stackname = names[0]
+            else:
+                sys.stderr.write(
+                    'ERROR: no stackname specified and multiple stacks found. %s. please specify --stackname\n' %
+                    names)
+                sys.exit(1)
+        else:
+            # stackname is specified.
+            pass
+
+    def set_parameters_filename(self, name):
+        if os.path.isfile(name):
+            self.parameters_filename = name
+        else:
+            raise ValueError("%s is not a file." % name)
+
+    def update_parameters(self):
+        if self.operation != 'delete':
+            self.register_template()
+            self.describe_stack()
+            output_keys = []
+            if 'Outputs' in self.stack:
+                for output in self.stack['Outputs']:
+                    key = output['OutputKey']
+
+                    if key not in self.parameters:
+                        output_keys.append(key)
+
+                    value = output['OutputValue']
+                    self.parameters[key] = value
+        else:
+            self.deregister_template()
+
+        if 'AWSProfile' not in self.parameters:
+            self.parameters['AWSProfile'] = self.aws_profile
+
+        if 'AWSRegion' not in self.parameters:
+            self.parameters['AWSRegion'] = self.aws_region
+
+        with open(self.parameters_filename, "w") as file:
+            for key in self.parameter_keys:
+                file.write('%s=%s\n' % (key, self.parameters[key]))
+            for key in output_keys:
+                file.write('%s=%s\n' % (key, self.parameters[key]))
+
+    def describe_change_set(self, verbose=True, with_new_tags=True):
+        self.changes = None
+        self.change_set_name = '%s-%s' % (self.stackname,
+                                          datetime.now().strftime('%Y-%m-%d-%H%M%S'))
+        try:
+            self.upload_template_to_bucket()
+            if verbose:
+                sys.stderr.write('INFO: creating change set %s\n' %
+                                 (self.change_set_name))
+
+            tags = self.create_cfn_tags() if with_new_tags else self.get_stack_tags()
+
+            response = self.cfn.create_change_set(
+                ChangeSetName=self.change_set_name,
+                StackName=self.stackname,
+                TemplateURL=self.template_url,
+                Tags=tags,
+                Capabilities=self.capabilities,
+                Parameters=self.create_cfn_parameters())
+
+            response = self.cfn.describe_change_set(
+                StackName=self.stackname, ChangeSetName=self.change_set_name)
+            if response['Status'] != 'FAILED':
+                while not response['Status'].endswith('COMPLETE') and not response['Status'].endswith('FAILED'):
+                    if verbose:
+                        sys.stderr.write('\rINFO: waiting for change set for %s, status %-50s' %
+                                         (self.stackname, response['Status']))
+                    time.sleep(5)
+                    response = self.cfn.describe_change_set(
+                        StackName=self.stackname, ChangeSetName=self.change_set_name)
+                if verbose:
+                    sys.stderr.write(
+                        '\rINFO: waited for change set for %s, status %-50s\n' % (self.stackname, response['Status']))
+
+            self.changes = response['Changes']
+            while 'NextToken' in response:
+                response = self.cfn.describe_change_set(
+                    StackName=self.stackname, ChangeSetName=self.change_set_name, NextToken=response['NextToken'])
+                if 'Changes' in response:
+                    self.changes.extend(response['Changes'])
+
+            database_replacements = []
+            for c in self.changes:
+                change = c['ResourceChange']
+
+                replacement = ''
+                if 'Replacement' in change:
+                    replacement = change['Replacement']
+                    if replacement == "True":
+                        replacement = " - replacement"
+                        if change['ResourceType'] == 'AWS::RDS::DBInstance':
+                            database_replacements.append(change)
+                    elif replacement == "False":
+                        replacement = ""
+                    else:
+                        replacement = " - conditional replacement"
+
+                fields = []
+                for detail in change['Details']:
+                    target = detail['Target']
+                    name = target['Attribute']
+                    if 'Name' in target:
+                        name = '%s.%s' % (name, target['Name'])
+                    fields.append(name)
+                fieldstr = ' (%s)' % ",".join(
+                    fields) if len(fields) > 0 else ''
+
+                if verbose:
+                    sys.stderr.write('INFO: %s - %s%s%s\n' % (change['Action'], change[
+                                     'LogicalResourceId'], replacement, fieldstr))
+
+            if self.changeset_directory is not None:
+                path = os.path.join(self.changeset_directory,
+                                    '%s.json' % self.template_basename)
+                with io.open(path, 'w', encoding='utf-8') as f:
+                    f.write(unicode(json.dumps(self.changes, ensure_ascii=False)))
+
+            if len(database_replacements) > 0 and not self.force:
+                sys.stderr.write(
+                    'ALERT: a database replacement takes place which destroys all data, but no --force is specified. Please make a snapshot, specify the SnapshotIdentifier in CFN and rerun.\n')
+                for c in database_replacements:
+                    sys.stderr.write('  aws --profile %s --region %s rds create-db-snapshot --db-instance-identifier %s --db-snapshot-identifier %s\n' %
+                                     (self.aws_profile, self.aws_region, c['PhysicalResourceId'], datetime.now().strftime('%s-%s-%%Y-%%m-%%d-%%H-%%M' % (self.domain_name, c['LogicalResourceId']))))
+                sys.exit(1)
+
+            if len(self.changes) == 0 and verbose:
+                print "INFO: no changes by this update."
+
+        except ClientError as e:
+            msg = e.response['Error']['Message']
+            print 'ERROR: %s' % msg
+            sys.exit(1)
+
+    def get_current_template(self):
+        try:
+            response = self.cfn.get_template(StackName=self.stackname)
+            self.current_template = response['TemplateBody']
+
+            # extract current parameters for processing
+            response = self.cfn.describe_stacks(
+                StackName=self.stackname)['Stacks'][0]
+            self.current_parameters = {}
+            for parameter in response['Parameters']:
+                self.current_parameters[
+                    parameter['ParameterKey']] = parameter['ParameterValue']
+
+        except ClientError as e:
+            msg = e.response['Error']['Message']
+            print 'ERROR: %s' % msg
+            sys.exit(1)
+
+    def add_missing_resources_to_current_template(self):
+        added = False
+        for parameter in self.template['Parameters']:
+            if parameter not in self.current_template['Parameters']:
+                added = True
+		if self.verbose:
+			sys.stderr.write('INFO: adding missing parameter %s\n' % resource )
+                self.current_template['Parameters'][
+                    parameter] = self.template['Parameters'][parameter]
+
+        if "Conditions" in self.template:
+            for condition in self.template['Conditions']:
+                if condition not in self.current_template['Conditions']:
+                    added = True
+                    
+		if self.verbose:
+			sys.stderr.write('INFO: adding missing condition %s\n' % condition )
+                self.current_template['Conditions'][
+                    condition] = self.template['Conditions'][condition]
+
+        for resource in self.template['Resources']:
+            if resource not in self.current_template['Resources']:
+                added = True
+		if self.verbose:
+			sys.stderr.write('INFO: adding missing resource %s\n' % resource )
+                self.current_template['Resources'][
+                    resource] = self.template['Resources'][resource]
+
+        for mapping in self.template['Mappings']:
+            self.current_template['Mappings'][
+                mapping] = self.template['Mappings'][mapping]
+
+        return added
+
+    def wait_for_instance(self, instance):
+        # find the logical id of the instance
+        response = self.cfn.describe_stack_resources(
+            StackName=self.stackname, LogicalResourceId=instance)
+        instance_id = response['StackResources'][0]['PhysicalResourceId']
+
+        waiting = 0
+        response = self.ec2.describe_instance_status(InstanceIds=[instance_id])
+        status = response['InstanceStatuses'][0]['InstanceStatus'][
+            'Status'] if len(response['InstanceStatuses']) > 0 else "not-running"
+        if status == "not-running":
+            return
+
+        while status != 'ok':
+            sys.stderr.write('\rINFO: waiting %ds for %s (%s) to be running, status %s' % (
+                waiting, instance, instance_id, status))
+            waiting += 10
+            time.sleep(10)
+            response = self.ec2.describe_instance_status(
+                InstanceIds=[instance_id])
+            status = response['InstanceStatuses'][0]['InstanceStatus'][
+                'Status'] if len(response['InstanceStatuses']) > 0 else "not-running"
+        sys.stderr.write('\rINFO: waited %ds for %s (%s) to be running%-30s\n' %
+                         (waiting, instance, instance_id, ''))
+
+        response = self.ec2.describe_instances(InstanceIds=[instance_id])
+        ip = response['Reservations'][0]['Instances'][0]['PrivateIpAddress']
+
+        # check for readiness of host
+        self.wait_for_readiness(instance, ip)
+
+    def wait_for_readiness(self, instance, ip):
+        check_script = os.path.join(os.path.dirname(self.template_filename), 'check-host-readiness')
+        if os.path.isfile(check_script) and os.access(check_script, os.X_OK):
+            waiting = 0
+            ready = False
+            while not ready:
+                process = subprocess.Popen([check_script, "-d", self.domain_name, "-h", instance,
+                                            "-i", ip], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                out = process.communicate()
+                lines = out[0].replace('\n', ' ').replace('\r', ' ')
+                ready = process.returncode == 0
+                if not ready:
+                    sys.stderr.write('\rINFO: waiting %ds for %s (%s) to be ready: -> %30s' % (waiting, instance, ip, lines))
+                    waiting += 10
+                    time.sleep(10)
+
+            sys.stderr.write('\rINFO: waited %ds for %s (%s) to be ready: %30s\n' % (waiting, instance, ip, lines))
+        else:
+            # no check-host-readiness
+            pass
+
+    def wait_for_stack(self, operation='update'):
+        waiting = 0
+        status = self.get_stack_status()
+        while not status.endswith('COMPLETE') and not status.endswith('FAILED'):
+            sys.stderr.write('\rINFO: waiting %ds for %s of %s to complete, status %-50s' %
+                             (waiting, operation, self.stackname, status))
+            waiting += 10
+            time.sleep(10)
+            status = self.get_stack_status()
+        sys.stderr.write('\rINFO: waited %ds for %s of %s to complete, status %-50s\n' %
+                         (waiting, operation, self.stackname, status))
+
+    def determine_instances_to_update(self):
+        """
+        returns a list instances from the current template which need to be updated.
+        """
+        result = []
+        self.get_current_template()
+        self.describe_change_set(verbose=False, with_new_tags=False)
+        instances = sorted(filter(lambda r: self.current_template['Resources'][r][
+                           'Type'] == 'AWS::EC2::Instance', self.current_template['Resources']))
+        for instance in instances:
+            if len(filter(lambda c: c['ResourceChange']['LogicalResourceId'] == instance
+                          and not (len(c['ResourceChange']['Scope']) == 1
+                                   and c['ResourceChange']['Scope'][0] == 'Tags'), self.changes)) > 0:
+                result.append(instance)
+        return result
+
+    def is_instance_reference(self, obj, instance_name):
+        result = obj['Ref'] == instance_name if isinstance(
+            obj, dict) and 'Ref' in obj else False
+
+    def remove_all_references(self, template, instance_name):
+        to_remove = {}
+        for toplevel in template:
+            if isinstance(template[toplevel], dict):
+                to_remove[toplevel] = []
+
+        for toplevel in to_remove:
+            for obj in template[toplevel]:
+                if self.has_instance_reference(template[toplevel][obj], instance_name, []):
+                    to_remove[toplevel].append(obj)
+        for toplevel in to_remove:
+            for obj in to_remove[toplevel]:
+                sys.stderr.write('INFO: Removing object %s from %s, as it references %s\n' % (
+                    obj, toplevel, instance_name))
+                template[toplevel].pop(obj)
+
+    def has_instance_reference(self, obj, instance_name, path):
+        result = False
+        if isinstance(obj, dict):
+            for fld in obj:
+                if fld == 'Ref' and obj['Ref'] == instance_name:
+                    if self.verbose:
+                        sys.stderr.write('INFO: Ref:%s found in %s\n' % (
+                            instance_name, '.'.join(path)))
+                    result = True
+                else:
+                    nested_path = path[:]
+                    nested_path.append(fld)
+                    result = result or self.has_instance_reference(
+                        obj[fld], instance_name, nested_path)
+
+        elif isinstance(obj, list):
+            for i in range(len(obj)):
+                nested_path = path[:]
+                nested_path.append('[%d]' % i)
+                if self.has_instance_reference(obj[i], instance_name, nested_path):
+                    if self.verbose:
+                        sys.stderr.write('INFO: Ref:%s found in array %s\n' % (
+                            instance_name, '.'.join(nested_path)))
+                    result = True
+        else:
+            pass
+
+        return result
+
+    def rolling_update_stack(self, destructive=False):
+        s = "destructive" if destructive else ""
+        print "INFO: %s rolling update stack %s in region %s with AWS profile %s" % (s, self.stackname, self.aws_region, self.aws_profile)
+        instances = self.determine_instances_to_update()
+        print "INFO: about to perform a rolling update on the instances %s." % ', '.join(instances)
+
+        #
+        # Add any new resources to the stack
+        #
+        self.get_current_template()
+        if self.add_missing_resources_to_current_template():
+            print "INFO: adding new resources to the stack."
+            self.template = self.current_template
+            self.update_stack(with_new_tags=False)
+        else:
+            print "INFO: no new resources to add to the stack."
+
+        for instance in instances:
+            self.load_template()
+            self.get_current_template()
+            self.add_missing_resources_to_current_template()
+
+            if destructive:
+                self.current_template['Resources'].pop(instance)
+                self.remove_all_references(self.current_template, instance)
+
+                self.template = self.current_template
+                self.update_stack(with_new_tags=False)
+
+                self.load_template()
+                self.get_current_template()
+                self.add_missing_resources_to_current_template()
+
+            if instance in self.template['Resources']:
+                self.current_template['Resources'][
+                    instance] = self.template['Resources'][instance]
+                self.template = self.current_template
+                self.update_stack(with_new_tags=False)
+                self.wait_for_instance(instance)
+            else:
+                print 'INFO: not updating instance %s as it is no longer present in the new template' % instance
+
+        # finally, update the rest of the stack.
+        self.load_template()
+        self.update_stack()
+
+    def update_stack(self, with_new_tags=True):
+        print "INFO: update stack %s in region %s with AWS profile %s" % (self.stackname, self.aws_region, self.aws_profile)
+        self.describe_change_set(with_new_tags=with_new_tags)
+
+        if not self.dry_run:
+            if len(self.changes) > 0:
+                response = self.cfn.execute_change_set(
+                    StackName=self.stackname, ChangeSetName=self.change_set_name)
+
+            self.wait_for_stack()
+            self.update_parameters()
+
+        else:
+            if len(self.changes) > 0:
+                self.load_template()
+                self.get_current_template()
+                if self.verbose:
+                    import jsonpatch
+                    x = jsonpatch.JsonPatch.from_diff(
+                        self.current_template, self.template)
+                    print json.dumps(x.to_string(), indent=2)
+
+    def upload_template_to_bucket(self):
+
+        bucket_name = '%s-%s' % (self.aws_profile, self.aws_region)
+        self.template_url = 'https://s3-%s.amazonaws.com/%s/%s/%s.json' % (
+            self.aws_region, bucket_name, self.stackname, self.template_basename)
+
+        if self.verbose:
+            print 'INFO: uploading template to %s' % self.template_url
+        response = self.s3.list_buckets()
+        if len(filter(lambda b: b['Name'] == bucket_name, response['Buckets'])) == 0:
+            self.s3.create_bucket(Bucket=bucket_name,  CreateBucketConfiguration={
+                                  'LocationConstraint': self.aws_region})
+
+        self.s3.upload_fileobj(StringIO.StringIO(json.dumps(
+            self.template)), bucket_name, '%s/%s.json' % (self.stackname, self.template_basename))
+
+    def create_stack(self):
+        print "INFO: create stack %s in region %s with AWS profile %s" % (self.stackname, self.aws_region, self.aws_profile)
+        if self.dry_run:
+            return
+
+        try:
+            self.upload_template_to_bucket()
+            response = self.cfn.create_stack(
+                StackName=self.stackname,
+                TemplateURL=self.template_url,
+                Tags=self.create_cfn_tags(),
+                Capabilities=self.capabilities,
+                Parameters=self.create_cfn_parameters(for_create=True))
+        except ClientError as e:
+            msg = e.response['Error']['Message']
+            print 'ERROR: %s' % msg
+            sys.exit(1)
+
+        self.wait_for_stack(operation='create')
+        self.update_parameters()
+
+    def destroy_stack(self):
+        print "INFO: destroy stack %s in region %s with AWS profile %s" % (self.stackname, self.aws_region, self.aws_profile)
+        if self.dry_run:
+            return
+        response = self.cfn.delete_stack(StackName=self.stackname)
+        self.wait_for_stack(operation='delete')
+        self.unregister_template()
+        self.update_parameters()
+
+    def show_template_parameters(self):
+        self.load_template()
+        if 'Parameters' in self.template:
+            for key in self.template['Parameters']:
+                sys.stdout.write(
+                    '%-30s = %s\n' % (key, self.template['Parameters'][key]['Description']))
+
+    def show_commit_lag(self):
+        number_of_changes = []
+        self.load_parameters()
+        self.connect_aws()
+
+        for template in self.deployed_templates:
+            self.set_template_filename(template)
+            self.stackname = None
+            self.set_stack_name(verbose=False)
+            self.load_template()
+            try:
+                self.stack = None
+            except ValueError as e:
+                print "ERROR: Bro, WTF Deploy this stack in the envrinoment"
+                print e 
+            self.describe_stack()
+	    release = map(lambda t: t['Value'], filter(lambda t: t['Key'] == 'GitRelease', self.stack['Tags']))
+	    if len(release) == 1:
+		    deployed_tag = release[0]
+		    match = re.match(r'(?P<name>.*)-(?P<release>[0-9]+\.[0-9]+\.[0-9]+)-{0,1}(?P<commit>[^-]*)(?P<dirty>-dirty){0,1}', self.git_release)
+		    current_commit = match.group('commit') if match and match.group('commit') else self.git_release
+		    match = re.match(r'(?P<name>.*)-(?P<release>[0-9]+\.[0-9]+\.[0-9]+)-{0,1}(?P<commit>[^-]*)(?P<dirty>-dirty){0,1}', deployed_tag)
+		    commit = match.group('commit') if match and match.group('commit') else deployed_tag
+		    print '# current version is %s, deployed is %s ' % (self.git_release, deployed_tag)
+		    print 'git diff %s %s -- %s' %( current_commit, commit, self.template_filename)
+	    else:
+		sys.stderr.write('WARN: not GitRelease tag found for template "%s"\n' % template)
+
+    def store_changesets(self):
+        number_of_changes = []
+        self.load_parameters()
+        self.connect_aws()
+
+        self.changeset_directory = 'stacks/%s/changesets' % aws_name(
+            self.domain_name)
+        if not os.path.exists(self.changeset_directory):
+            os.makedirs(self.changeset_directory)
+
+        for template in self.deployed_templates:
+            self.set_template_filename(template)
+            self.stackname = None
+            self.set_stack_name()
+            self.load_template()
+            self.describe_change_set(verbose=self.verbose)
+            number_of_changes.append(
+                {'name': self.template_basename, 'count': len(self.changes)})
+
+        for template in number_of_changes:
+            print 'INFO: %s has %d changes' % (template['name'], template['count'])
+
+    def estimate_stack_cost(self):
+        if self.dry_run:
+            print "INFO: estimate cost of stack %s in region %s with AWS profile %s" % (self.stackname, self.aws_region, self.aws_profile)
+            return
+
+        try:
+            self.upload_template_to_bucket()
+            response = self.cfn.estimate_template_cost(
+                TemplateURL=self.template_url,
+                Parameters=self.create_cfn_parameters(for_create=True))
+        except ClientError as e:
+            msg = e.response['Error']['Message']
+            print 'ERROR: %s' % msg
+            sys.exit(1)
+
+        return response['Url']
+
+    def estimate_cost(self):
+        self.initialize()
+        # for a single template or for all templates in the domain
+        templates = self.deployed_templates if not self.template_filename else [
+            self.template_filename]
+        for template in templates:
+            self.set_template_filename(template)
+            self.stackname = None
+            self.set_stack_name(verbose=self.verbose)
+            self.load_template()
+            self.current_template = None
+            url = self.estimate_stack_cost()
+
+            process = subprocess.Popen(["scrape-aws-calculator", url], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, err = process.communicate()
+            bill = out.strip()
+            if bill != '':
+                print '%s\t%s\t%s' % (template, url, bill)
+            else:
+                msg = err.strip() if err else ''
+                sys.stderr.write('ERROR: scrape-aws-calculcator failed %s\n' % msg)
+                print '%s\t%s\t-' % (template, url)
+
+    def main(self):
+        parser = argparse.ArgumentParser(description='update the stack')
+        parser.add_argument("--domain-name", "-d", dest="domain_name",
+                            help="to update the stack in", metavar="STRING")
+        parser.add_argument("--template", "-t", dest="template_filename",
+                            help="CloudFormation template file", metavar="FILE")
+        parser.add_argument("--profile", "-p", dest="aws_profile", default=self.aws_profile,
+                            help="AWS profile to use", metavar="STRING")
+        parser.add_argument("--region", "-r", dest="region",
+                            default=self.aws_region, help="AWS region to use", metavar="STRING")
+        parser.add_argument("--stack-name", "-n", dest="stackname",
+                            help="name of the stack in cloudformation, defaults to domain-templatename", metavar="STRING")
+        parser.add_argument("--parameters-filename", "-P", dest="parameters_filename",
+                            help="parameter filename, defaults to stacks/<name>/stack-parameters", metavar="FILE")
+        parser.add_argument("--dry-run", "-N", action="store_true", dest="dry_run",
+                            help="do not change anything, just show what is going to happen")
+        parser.add_argument("--verbose", "-v", action="store_true",
+                            dest="verbose", help="verbose mode")
+        parser.add_argument("--force",  action="store_true",
+                            dest="force", help="force update of database instances")
+
+        group = parser.add_mutually_exclusive_group(required=True)
+        group.add_argument("--create", "-c", action="store_true",
+                           dest="create", help="create the stack")
+        group.add_argument("--update", "-u", action="store_true",
+                           dest="update", help="update the stack")
+        group.add_argument("--rolling-update", "-l", action="store_true",
+                           dest="rolling_update", help="rolling update of the instances")
+        group.add_argument("--destructive-rolling-update", "-D", action="store_true",
+                           dest="destructive_rolling_update", help="destructive rolling update of the instances")
+        group.add_argument("--estimate-cost", '-e', action="store_true",
+                           dest="estimate_cost", help="estimate the cost of the stack")
+        group.add_argument("--destroy", action="store_true",
+                           dest="destroy", help="destroy the stack")
+        group.add_argument("--shutdown", "-X", action="store_true",
+                           dest="shutdown", help="shutdown all instances the domain")
+        group.add_argument("--startup", "-S", action="store_true",
+                           dest="startup", help="startup all instances in the domain")
+        group.add_argument("--show-parameters", "-s", action="store_true",
+                           dest="show_parameters", help="show stack parameters")
+        group.add_argument("--changesets", "-C", action="store_true", dest="store_changesets",
+                           help="store changesets for all deployed templates")
+        group.add_argument("--show-commit-lag", action="store_true", dest="show_commit_lag",
+                           help="show commit lag of deployed templates")
+
+        options = parser.parse_args()
+
+        if not options.domain_name and not options.show_parameters:
+            parser.error('--domain-name/-d is required')
+
+        if not options.domain_name and (not self.store_changesets and not self.estimate_cost and not self.shutdown and not self.startup):
+            parser.error('--template/-t is required')
+
+        if options.template_filename:
+            self.set_template_filename(options.template_filename)
+
+        if options.show_parameters:
+            if options.template_filename:
+                self.show_template_parameters()
+                sys.exit(0)
+            else:
+                parser.error('--template/-t is required')
+                sys.exit(1)
+
+        self.force = options.force
+        self.domain_name = options.domain_name
+        self.aws_profile = options.aws_profile
+        self.aws_region = options.region
+        self.dry_run = options.dry_run
+        self.verbose = options.verbose
+
+        if options.shutdown:
+            switch = SwitchServers(verbose=options.verbose)
+            switch.shutdown(options.domain_name, dry_run=options.dry_run)
+            sys.exit(0)
+        elif options.startup:
+            switch = SwitchServers(verbose=options.verbose)
+            switch.startup(options.domain_name, dry_run=options.dry_run)
+            sys.exit(0)
+        else:
+            pass
+
+        if options.parameters_filename:
+            self.set_parameters_filename(options.parameters_filename)
+
+        if options.store_changesets:
+            self.store_changesets()
+            sys.exit(0)
+        elif options.show_commit_lag:
+            self.show_commit_lag()
+            sys.exit(0)
+        elif options.estimate_cost:
+            self.estimate_cost()
+            sys.exit(0)
+
+        self.initialize()
+
+        self.set_stack_name()
+        self.load_template()
+
+        if options.update:
+            self.operation = 'update'
+            self.update_stack()
+        elif options.rolling_update:
+            self.operation = 'rolling-update'
+            self.rolling_update_stack()
+        elif options.destructive_rolling_update:
+            self.operation = 'destructive-rolling-update'
+            self.rolling_update_stack(destructive=True)
+        elif options.create:
+            self.operation = 'create'
+            self.create_stack()
+        elif options.destroy:
+            self.operation = 'destroy'
+            self.destroy_stack()
+        else:
+            parser.error(
+                'missing --create/-c, --estimate-cost/-e, --update/-u, --rolling-update/-l, --destructive-rolling-update/-D, --changesets/-C  or --destroy option')
+
+
+class TemplateLoader:
+
+    def __init__(self, path, verbose=False):
+        self.path = path
+        self.verbose = verbose
+        self.dirname = os.path.dirname(path)
+        self.basename = os.path.splitext(os.path.basename(path))[0]
+
+    def get_git_release(self):
+        tagger = GitReleaseTagger()
+        if tagger.path_has_release(self.dirname):
+            tagger.set_directory(self.dirname)
+            return '%s-%s' % (tagger.base_tag, tagger.current_release)
+        else:
+            return 'unversioned'
+
+    def load(self):
+        template = None
+        with open(self.path, "r") as file:
+            template = json.load(file)
+        for hostname in template['Resources']:
+            resource = template['Resources'][hostname]
+            if resource['Type'] == 'AWS::EC2::Instance' or resource['Type'] == 'AWS::AutoScaling::LaunchConfiguration':
+                userdata = resource['Properties'][
+                    'UserData'] if 'UserData' in resource['Properties'] else None
+                if userdata and 'stack::upload' in userdata:
+                    content = self.read_user_data(hostname, os.path.join(
+                        self.dirname, userdata['stack::upload']), required=True)
+                else:
+                    content = self.read_user_data(hostname, os.path.join(
+                        self.dirname, hostname + '-user-data.yml'))
+                if content:
+                    resource['Properties']['UserData'] = content
+                    if self.verbose:
+                        sys.stderr.write(
+                            'INFO: Updating UserData of %s in %s\n' % (hostname, self.path))
+            elif resource['Type'] == 'AWS::Lambda::Function':
+                code = resource['Properties']['Code'] if 'Code' in resource['Properties'] else None
+                if code and 'ZipFile' in code:
+                    if 'stack::upload' in code['ZipFile']:
+                        code_filename = os.path.join(self.dirname, code['ZipFile']['stack::upload'])
+                        code['ZipFile'] = self.read_lambda(hostname, code_filename)
+            else:
+                pass
+
+        rev = self.get_git_release()
+        description = (' - %s' % template['Description']) if 'Description' in template else ''
+        template['Description'] = '%s%s' % (rev, description)
+
+        return template
+
+    def read_file_to_json(self, hostname, filename, required=True):
+        with open(filename, 'r') as content_file:
+            content = content_file.read()
+        content = content.replace('\\', '\\\\')
+        content = content.replace('"', '\\"')
+        content = re.sub(r'\{\{Var:Hostname\}\}', hostname, content)
+        content = re.sub(r'\{\{Var:Filename\}\}', self.basename, content)
+        content = re.sub(r'\n', '\\\\n",\n    "', content)
+        content = re.sub(r'\{\{Ref:(?P<name>[^\}]*)\}\}',
+                         '",\n    { "Ref": "\g<name>"},\n    "', content)
+        try:
+            result = json.loads('{ "Fn::Join": [ "", [ "%s" ] ] }' % content)
+        except Exception as e:
+            sys.stderr.write('ERROR: transforming content of %s to json: %s' % (filename, e))
+            sys.stderr.write(content)
+            sys.exit(1)
+        return result
+
+    def read_lambda(self, hostname, filename):
+        result = None
+        if self.verbose:
+            sys.stderr.write(
+                'INFO: reading code for Lambda %s from %s\n' % (hostname, filename))
+
+        if os.path.isfile(filename):
+            result = self.read_file_to_json(hostname, filename)
+        else:
+            sys.stderr.write('ERROR: the specified file %s for lambda %s does not exist\n' % (filename, hostname))
+            sys.exit(1)
+
+        return result
+
+    def read_user_data(self, hostname, filename, required=False):
+        result = None
+        if os.path.isfile(filename):
+            if self.verbose:
+                sys.stderr.write(
+                    'INFO: reading UserData for instance %s from %s\n' % (hostname, filename))
+
+            result = {}
+            result['Fn::Base64'] = self.read_file_to_json(hostname, filename)
+        else:
+            if self.verbose:
+                sys.stderr.write(
+                    'INFO: no UserData found for instance %s\n' % (hostname))
+            if required:
+                sys.stderr.write('ERROR: the specified UserData file %s for instance %s does not exist\n' % (
+                    filename, hostname))
+                sys.exit(1)
+
+        return result
+
+
+class SwitchServers:
+
+    def __init__(self, verbose=False):
+        self.domain_name = None
+        self.stackname_prefix = None
+        self.aws_profile = None
+        self.aws_region = None
+        self.parameters_filename = None
+        self.verbose = verbose
+
+    def set_aws_profile(self):
+        if 'AWSProfile' in self.parameters:
+            self.aws_profile = self.parameters['AWSProfile']
+        else:
+            self.aws_profile = os.getenv(
+                'AWS_PROFILE', os.getenv('AWS_DEFAULT_PROFILE', 'default'))
+
+    def set_aws_region(self):
+        if 'AWSRegion' in self.parameters:
+            self.aws_region = self.parameters['AWSRegion']
+        else:
+            self.aws_region = os.getenv('AWS_DEFAULT_REGION', None)
+
+    def initialize(self):
+        self.session = boto3.Session(
+            profile_name=self.aws_profile, region_name=self.aws_region)
+        self.ec2 = self.session.client('ec2')
+        self.autoscaling = self.session.client('autoscaling')
+        self.stackname_prefix = '%s-' % aws_name(self.domain_name)
+
+    def retrieve_asg(self):
+        result = self.autoscaling.describe_auto_scaling_groups(
+            AutoScalingGroupNames=[self.autoscaling_group_name], MaxRecords=100)
+        if 'AutoScalingGroups' in result and len(result['AutoScalingGroups']) == 1:
+            self.asg = result['AutoScalingGroups'][0]
+        else:
+            raise 'no autoscaling group found with name %s' % self.autoscaling_group_name
+
+    def find_all_matching_autoscaling_groups(self):
+        result = []
+        paginator = self.autoscaling.get_paginator(
+            'describe_auto_scaling_groups')
+        for response in paginator.paginate():
+            result.extend(map(lambda a: a['AutoScalingGroupName'],
+                              filter(lambda a: self.get_tag_value(a, 'aws:cloudformation:stack-name').startswith(self.stackname_prefix), response['AutoScalingGroups'])))
+        return result
+
+    def switch_asg(self):
+        asg_names = self.find_all_matching_autoscaling_groups()
+        if len(asg_names) > 0:
+            for name in asg_names:
+                response = self.autoscaling.describe_auto_scaling_groups(
+                    AutoScalingGroupNames=[name], MaxRecords=1)
+                if 'AutoScalingGroups' in response and len(response['AutoScalingGroups']) == 1:
+                    asg = response['AutoScalingGroups'][0]
+                    desired_size = asg['MaxSize'] if self.turn_on else 0
+                    if asg['DesiredCapacity'] != desired_size:
+                        print 'INFO: setting autoscaling group %s desired size from %d to %d' % (name, asg['DesiredCapacity'], desired_size)
+                        if not self.dry_run:
+                            self.autoscaling.update_auto_scaling_group(
+                                AutoScalingGroupName=name, DesiredCapacity=desired_size, MinSize=0)
+        else:
+            print 'INFO: no autoscaling groups found'
+
+    def add_default_parameters(self):
+        self.set_aws_profile()
+        self.set_aws_region()
+
+    def load_parameters(self):
+        if not self.parameters_filename:
+            self.parameters_filename = './stacks/%s/stack-parameters' % aws_name(
+                self.domain_name)
+
+        self.parameters = {}
+        with open(self.parameters_filename, "r") as file:
+            for line in file:
+                line = line.rstrip()
+                parts = line.split("=", 2)
+                if len(parts) == 2:
+                    self.parameters[parts[0]] = parts[1]
+                else:
+                    raise ValueError("incorrect syntax: %s" % line)
+        self.add_default_parameters()
+
+    def get_tag_value(self, instance, key):
+        result = []
+        if 'Tags' in instance:
+            result = map(lambda c: c['Value'], filter(
+                lambda t: t['Key'] == key, instance['Tags']))
+        return result[0] if len(result) > 0 else ''
+
+    def select_all_instances(self, state):
+        result = []
+        response = self.ec2.describe_instances(
+            Filters=[{'Name': 'instance-state-name', 'Values': [state]}])
+        for reservation in response['Reservations']:
+            for instance in reservation['Instances']:
+                cfn_stack_name = self.get_tag_value(
+                    instance, 'aws:cloudformation:stack-name')
+                if cfn_stack_name.startswith(self.stackname_prefix) or cfn_stack_name == aws_name(self.domain_name):
+                    result.append(instance)
+
+        result = sorted(result, key=lambda instance: self.get_tag_value(
+            instance, 'aws:cloudformation:logical-id'))
+
+        if self.verbose:
+            map(lambda i: (sys.stdout.write('DEBUG: instance %s (%s)\n' %
+                                            (self.get_tag_value(i, 'aws:cloudformation:logical-id'), i['InstanceId']))), result)
+        return result
+
+    def switch_instances(self):
+        instances = self.select_all_instances(
+            'stopped' if self.turn_on else 'running')
+        if len(instances) > 0:
+            if self.turn_on:
+                print 'INFO: switching on %d instances' % len(instances)
+                if not self.dry_run and len(instances) > 0:
+                    self.ec2.start_instances(InstanceIds=map(
+                        lambda i: i['InstanceId'], instances))
+            else:
+                print 'INFO: switching off %d instances' % len(instances)
+                if not self.dry_run and len(instances) > 0:
+                    self.ec2.stop_instances(InstanceIds=map(
+                        lambda i: i['InstanceId'], instances))
+        else:
+            print 'INFO: no instances found'
+
+    def shutdown(self, domain_name, dry_run):
+        self.domain_name = domain_name
+        self.dry_run = dry_run
+        self.turn_on = False
+        self.load_parameters()
+        self.initialize()
+        self.execute()
+
+    def startup(self, domain_name, dry_run):
+        self.domain_name = domain_name
+        self.dry_run = dry_run
+        self.turn_on = True
+        self.load_parameters()
+        self.initialize()
+        self.execute()
+
+    def execute(self):
+        self.switch_asg()
+        self.switch_instances()
+
+
+if __name__ == "__main__":
+    try:
+        StackUpdate().main()
+        sys.exit(0)
+    except ValueError as e:
+        sys.stderr.write('ERROR: %s\n' % e)
+        sys.stderr.write( "{0}".format( sys.exc_info()[2] ))
+        sys.exit(1)
+    except ClientError as e:
+        msg = e.response['Error']['Message']
+        sys.stderr.write('ERROR: %s\n' % msg)
+        sys.exit(1)
+
