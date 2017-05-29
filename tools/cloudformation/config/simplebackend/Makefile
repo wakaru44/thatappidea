@@ -1,7 +1,7 @@
 # A simple makefile to make things simpler
 
 help:
-	@echo "Troposphere code to generate a personal workstation in the cloud";
+	@echo "Troposphere code to generate a small instance in the cloud";
 	@echo "";
 	@echo "generate       - generate the cloud formation stack from py to json";
 	@echo "bump           - Bump the version of the stack, as it will be identified in AWS";
@@ -12,7 +12,7 @@ help:
 	@echo "";
 
 generate:
-	python personal_stack.py > personal_stack.json
+	python simplebackend.py > simplebackend.json
 
 create:
 	bash tool_createstack.sh
