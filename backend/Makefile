@@ -24,3 +24,6 @@ docker-build: Dockerfile
 
 docker-run: 
 	@docker run -ti thisapi:latest 
+
+test:
+	@echo "We have no tests for you my friend"
