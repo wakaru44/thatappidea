@@ -14,4 +14,9 @@ csrf(app)
 db = SQLAlchemy(app)
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False # Is it here?
 
+#TODO init_db should go here???
+
+def init_db():
+    pass
+
 from thisapi import main

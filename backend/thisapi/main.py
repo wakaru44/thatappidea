@@ -2,37 +2,14 @@
 # -*- coding: utf-8 -*-
 
 from flask import Flask, url_for, render_template, request, \
-    redirect, abort, session, g, flash, Markup, jsonify
+    redirect, abort, session, g, flash, Markup
 from thisapi import app
-
-
-@app.route('/event', defaults={"path": ""})
-@app.route('/event/<path:whatever>')
-def event_listener(whatever):
-    app.logger.info(whatever)
-    """
-    a sample method of a catch-all path
-    """
-    return "You went to {0}".format(whatever)
+from helpers import *
 
 
 @app.route('/')
 def index():
     return "You are at the homepage of this API™!"
-
-def retrieve_party(party_id= None):
-    """
-    Retrieve the party from whatever datastore
-    """
-    assert party_id is not  None
-    party_data = {
-            'partyid':party_id,
-            "videos":[
-                {"v":"ZZZZ","title":"papayas"},
-                {"v":"AAAA","title":"bananas"},
-            ]
-    }
-    return party_data
 
 
 @app.route('/v1/get_party', defaults={"requestpath": ""})
@@ -41,29 +18,32 @@ def get_party(requestpath= None):
     """
     Retrieve the party for the given id.
     """
-    #TODO: This get_party method is just a fake stub
+    # use the given party id to retrieve existing data if any
+    # If the party doesn't exist, it will return an empty one
     requested_id = request.args['pid']
+    if validate_pid(requested_id) is  None:
+        redirect(url_for("index"))
     party_content = retrieve_party(requested_id)
-    # give at least some default data
-    if party_content is  None:
-        party_content = {"Error": "No party found"}
 
-    # Choose the output format
-    if requestpath == "json":
-        return jsonify(party_content)
-    # If nothing else, just output a pretty something
-    return render_template('pretty_json.html', data=party_content)
+    return render_output(data=party_content, oformat=requestpath)
 
 
-@app.route('/v1/add_vid')
-def add_vid():
+@app.route('/v1/add_vid', defaults={"requestpath":""}, methods=["PUT"])
+@app.route('/v1/add_vid.<path:requestpath>', methods=["PUT"])
+def add_vid(requestpath=None):
     """
-    Add a video to the end of the playlist
+    Add a video to the end of the playlist. It should support put/post and for
+    get return method not allowed
     """
-    party_data = retrieve_party("XXXX")
-    video = {"v":request.params["v"], "title":"FOOBAR"}
+    new_vid = validate_v(request.args["new_vid"])
+    pid = validate_pid(request.args["party_id"])
+    if pid is None or new_vid is None:
+        redirect(url_for('index'))
+    video = get_vid_info(new_vid)
+    party_data = retrieve_party(pid)
     party_data["videos"].append(video) #TODO: check if this is in fact mutable.
     party_content = json.dumps(party_data)
+    return render_output(data=party_data, oformat=requestpath)
     return render_template('json.html', data=party_content)
 
 
@@ -77,7 +57,7 @@ def page_not_found(error):
     return render_template('page_not_found.html'), 404
 
 
-@app.route('/upload', methods=['GET', 'POST'])
+@app.route('/upload', methods=['POST'])
 def upload_file():
     if request.method == 'POST':
         f = request.files['file']
